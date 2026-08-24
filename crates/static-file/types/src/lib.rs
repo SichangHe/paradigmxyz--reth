@@ -14,6 +14,7 @@ extern crate alloc;
 mod compression;
 mod event;
 mod segment;
+mod segment_range;
 
 #[cfg(all(feature = "std", unix))]
 mod changeset_offsets;

@@ -1,10 +1,8 @@
+pub use crate::segment_range::SegmentRangeInclusive;
 use crate::{find_fixed_range, BlockNumber, Compression};
 use alloc::{format, string::String};
 use alloy_primitives::TxNumber;
-use core::{
-    ops::{Range, RangeInclusive},
-    str::FromStr,
-};
+use core::{ops::Range, str::FromStr};
 use reth_stages_types::StageId;
 use serde::{de::Visitor, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 use strum::{EnumIs, EnumString};
@@ -619,71 +617,6 @@ pub struct SegmentConfig {
     pub compression: Compression,
 }
 
-/// Helper type to handle segment transaction and block INCLUSIVE ranges.
-///
-/// They can be modified on a hot loop, which makes the `std::ops::RangeInclusive` a poor fit.
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone, Copy)]
-pub struct SegmentRangeInclusive {
-    start: u64,
-    end: u64,
-}
-
-impl SegmentRangeInclusive {
-    /// Creates a new [`SegmentRangeInclusive`]
-    pub const fn new(start: u64, end: u64) -> Self {
-        Self { start, end }
-    }
-
-    /// Start of the inclusive range
-    pub const fn start(&self) -> u64 {
-        self.start
-    }
-
-    /// End of the inclusive range
-    pub const fn end(&self) -> u64 {
-        self.end
-    }
-
-    /// Returns the length of the inclusive range.
-    pub const fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start).saturating_add(1)
-    }
-
-    /// Returns true if the range is empty.
-    pub const fn is_empty(&self) -> bool {
-        self.start > self.end
-    }
-
-    /// Returns whether or not the segment range includes the number
-    pub fn contains(&self, number: u64) -> bool {
-        (self.start..=self.end).contains(&number)
-    }
-}
-
-impl core::fmt::Display for SegmentRangeInclusive {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}..={}", self.start, self.end)
-    }
-}
-
-impl From<RangeInclusive<u64>> for SegmentRangeInclusive {
-    fn from(value: RangeInclusive<u64>) -> Self {
-        Self { start: *value.start(), end: *value.end() }
-    }
-}
-
-impl From<&SegmentRangeInclusive> for RangeInclusive<u64> {
-    fn from(value: &SegmentRangeInclusive) -> Self {
-        value.start()..=value.end()
-    }
-}
-
-impl From<SegmentRangeInclusive> for RangeInclusive<u64> {
-    fn from(value: SegmentRangeInclusive) -> Self {
-        (&value).into()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +690,129 @@ mod tests {
             let filename = segment.filename(&dummy_range);
             assert_eq!(Some((segment, dummy_range)), StaticFileSegment::parse_filename(&filename));
         }
+    }
+
+    #[test]
+    fn segment_range_numeric_semantics() {
+        let reversed = SegmentRangeInclusive::new(10, 9);
+        let before = reversed;
+        assert!(reversed.is_empty());
+        assert_eq!(reversed.len(), 0);
+        assert!(!reversed.contains(9));
+        assert!(!reversed.contains(10));
+        assert_eq!(reversed, before);
+
+        for value in [0, u64::MAX] {
+            let singleton = SegmentRangeInclusive::new(value, value);
+            assert!(!singleton.is_empty());
+            assert_eq!(singleton.len(), 1);
+            assert!(singleton.contains(value));
+        }
+
+        let ordinary = SegmentRangeInclusive::new(10, 20);
+        assert_eq!(ordinary.len(), 11);
+        assert!(!ordinary.contains(9));
+        assert!(ordinary.contains(10));
+        assert!(ordinary.contains(15));
+        assert!(ordinary.contains(20));
+        assert!(!ordinary.contains(21));
+
+        assert_eq!(SegmentRangeInclusive::new(0, 1).len(), 2);
+        assert_eq!(SegmentRangeInclusive::new(u64::MAX - 1, u64::MAX).len(), 2);
+
+        let full_domain = SegmentRangeInclusive::new(0, u64::MAX);
+        assert_eq!(full_domain.len(), u64::MAX);
+        assert!(full_domain.contains(0));
+        assert!(full_domain.contains(u64::MAX / 2));
+        assert!(full_domain.contains(u64::MAX));
+    }
+
+    #[test]
+    fn segment_range_endpoints_and_conversions() {
+        for (start, end, probe) in [(3, 7, 5), (9, 8, 9), (0, u64::MAX, u64::MAX)] {
+            let standard = start..=end;
+            let expected_empty = standard.is_empty();
+            let expected_contains = standard.contains(&probe);
+            let converted = SegmentRangeInclusive::from(standard);
+
+            assert_eq!(converted.start(), start);
+            assert_eq!(converted.end(), end);
+            assert_eq!(converted.is_empty(), expected_empty);
+            assert_eq!(converted.contains(probe), expected_contains);
+
+            let borrowed_round_trip: core::ops::RangeInclusive<u64> = (&converted).into();
+            assert_eq!((*borrowed_round_trip.start(), *borrowed_round_trip.end()), (start, end));
+            assert_eq!(borrowed_round_trip.is_empty(), expected_empty);
+            assert_eq!(borrowed_round_trip.contains(&probe), expected_contains);
+
+            let owned_round_trip: core::ops::RangeInclusive<u64> = converted.into();
+            assert_eq!((*owned_round_trip.start(), *owned_round_trip.end()), (start, end));
+        }
+
+        let mut exhausted_by_next = 4..=5;
+        assert_eq!(exhausted_by_next.by_ref().collect::<Vec<_>>(), [4, 5]);
+
+        let mut exhausted_by_nth = 4..=10;
+        assert_eq!(exhausted_by_nth.nth(100), None);
+
+        let mut exhausted_by_next_back = 4..=10;
+        assert_eq!(
+            exhausted_by_next_back.by_ref().rev().collect::<Vec<_>>(),
+            [10, 9, 8, 7, 6, 5, 4]
+        );
+
+        for exhausted in [exhausted_by_next, exhausted_by_nth, exhausted_by_next_back] {
+            let endpoints = (*exhausted.start(), *exhausted.end());
+            let converted = SegmentRangeInclusive::from(exhausted);
+            assert_eq!((converted.start(), converted.end()), endpoints);
+        }
+    }
+
+    #[test]
+    fn segment_range_display_and_serde() {
+        let range = SegmentRangeInclusive::new(3, 7);
+        assert_eq!(range.to_string(), "3..=7");
+
+        let serialized = serde_json::to_string(&range).unwrap();
+        assert_eq!(serialized, r#"{"start":3,"end":7}"#);
+        assert_eq!(serde_json::from_str::<SegmentRangeInclusive>(&serialized).unwrap(), range);
+    }
+
+    #[test]
+    fn segment_header_range_users() {
+        let reversed_blocks = SegmentHeader::new(
+            SegmentRangeInclusive::new(0, 99),
+            Some(SegmentRangeInclusive::new(20, 19)),
+            None,
+            StaticFileSegment::Headers,
+        );
+        assert_eq!(reversed_blocks.block_len(), Some(0));
+
+        let reversed_transactions = SegmentHeader::new(
+            SegmentRangeInclusive::new(0, 99),
+            None,
+            Some(SegmentRangeInclusive::new(30, 29)),
+            StaticFileSegment::Transactions,
+        );
+        assert_eq!(reversed_transactions.tx_len(), Some(0));
+
+        let mut changesets = SegmentHeader::new(
+            SegmentRangeInclusive::new(100, 199),
+            Some(SegmentRangeInclusive::new(120, 122)),
+            None,
+            StaticFileSegment::AccountChangeSets,
+        );
+        changesets.set_changeset_offsets_len(2);
+        assert_eq!(changesets.block_len(), Some(3));
+        assert_eq!(changesets.changeset_offset_index(120), Some(0));
+        assert_eq!(changesets.changeset_offset_index(121), Some(1));
+        assert_eq!(changesets.changeset_offset_index(122), None);
+        assert_eq!(changesets.changeset_offset_index(119), None);
+        assert_eq!(changesets.changeset_offset_index(123), None);
+
+        changesets.set_block_range(130, 129);
+        assert_eq!(changesets.block_len(), Some(0));
+        assert_eq!(changesets.changeset_offset_index(130), None);
     }
 
     #[test]
